@@ -460,6 +460,7 @@ const listTransactionsHandler = async (req, res) => {
 
       return {
         ...transaction,
+        date: normalizeTransactionDate(transaction.date),
         category_id: category.id,
         category_name: category.name,
         category_color_hex: category.color_hex,
@@ -785,6 +786,36 @@ app.put("/api/budget", requireAuth, async (req, res) => {
     res.status(500).json({ message: "無法更新預算", error: error.message });
   }
 });
+
+// 將 Excel/Sheets 序列編號轉成 Date
+const excelSerialToDate = (serial) => {
+  const n = Number(serial);
+  if (!Number.isFinite(n)) return null;
+  // Excel serial epoch: 1899-12-30 (accounts for 1900 leap year bug)
+  const epoch = new Date(Date.UTC(1899, 11, 30));
+  return new Date(epoch.getTime() + n * 24 * 60 * 60 * 1000);
+};
+
+const normalizeTransactionDate = (value) => {
+  if (value === undefined || value === null || value === "") return "";
+  // 如果是大型數字（很可能是 timestamp 毫秒）
+  const asNumber = Number(value);
+  if (!Number.isNaN(asNumber)) {
+    if (Math.abs(asNumber) > 1e11) { // 毫秒 timestamp
+      const d = new Date(asNumber);
+      if (!isNaN(d)) return d.toISOString().split("T")[0];
+    }
+    // 若是合理範圍內的序列編號（例如 40000..50000）
+    if (asNumber > 0 && asNumber < 100000) {
+      const d = excelSerialToDate(asNumber);
+      if (!isNaN(d)) return d.toISOString().split("T")[0];
+    }
+  }
+  // 嘗試解析字串表示
+  const d = new Date(value);
+  if (!isNaN(d)) return d.toISOString().split("T")[0];
+  return String(value);
+};
 
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
