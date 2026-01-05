@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 const SHEET_ID =
   process.env.GOOGLE_SHEET_ID || "1MeCb_ClcxP-H_e6vYid49l-ayRd0cF-TE_StXRO9dnM";
 const TRANSACTION_SHEET_RANGE =
-  process.env.GOOGLE_TRANSACTION_RANGE || "'transactions'!A:F";
+  process.env.GOOGLE_TRANSACTION_RANGE || "'transactions'!A:H";
 const TRANSACTION_COLUMNS = [
   "id",
   "date",
@@ -23,6 +23,8 @@ const TRANSACTION_COLUMNS = [
   "category_id",
   "amount",
   "note",
+  "paid_by",
+  "is_reimbursed",
 ];
 const REQUIRED_TRANSACTION_COLUMNS = ["id", "date", "type", "amount"];
 const CATEGORY_SHEET_RANGE =
@@ -56,6 +58,11 @@ const API_ENDPOINTS = [
     method: "DELETE",
     path: "/api/transactions/:id",
     description: "刪除記帳資料",
+  },
+  {
+    method: "PATCH",
+    path: "/api/transactions/:id/reimburse",
+    description: "標記補款狀態",
   },
   { method: "GET", path: "/api/categories", description: "取得所有類別與色碼" },
   { method: "POST", path: "/api/categories", description: "新增類別" },
@@ -458,12 +465,46 @@ const listTransactionsHandler = async (req, res) => {
         findCategoryByName(categories, transaction.category) ||
         DEFAULT_CATEGORY;
 
+      // 處理代墊欄位（向後相容：舊資料可能沒有這些欄位）
+      const paidBy = (transaction.paid_by || "").trim();
+      const validPaidBy = ["Alan", "Peiya"].includes(paidBy) ? paidBy : "";
+      
+      // 處理 is_reimbursed：Google Sheets 可能返回 true/false 布林值或 "true"/"false" 字串
+      // 也可能返回 "TRUE"/"FALSE"（大寫）或其他格式
+      const isReimbursedRaw = transaction.is_reimbursed;
+      let isReimbursed = "false";
+      
+      // 優先檢查布林值 true
+      if (isReimbursedRaw === true) {
+        isReimbursed = "true";
+      } 
+      // 然後檢查字串格式（不區分大小寫）
+      else if (typeof isReimbursedRaw === "string") {
+        const normalized = isReimbursedRaw.trim().toLowerCase();
+        if (normalized === "true" || normalized === "1") {
+          isReimbursed = "true";
+        } else {
+          isReimbursed = "false";
+        }
+      }
+      // 檢查數字格式
+      else if (isReimbursedRaw === 1 || isReimbursedRaw === "1") {
+        isReimbursed = "true";
+      }
+      // 明確為 false 時設為 "false"
+      else if (isReimbursedRaw === false) {
+        isReimbursed = "false";
+      }
+      // 其他情況（undefined, null, 空字串等）預設為 "false"
+
       return {
         ...transaction,
         date: normalizeTransactionDate(transaction.date),
         category_id: category.id,
         category_name: category.name,
         category_color_hex: category.color_hex,
+        paid_by: validPaidBy,
+        is_reimbursed: isReimbursed,
       };
     });
 
@@ -506,9 +547,18 @@ const createTransactionHandler = async (req, res) => {
         ...DEFAULT_CATEGORY,
       };
 
+    // 處理代墊欄位
+    const paidBy = (req.body.paid_by || "").trim();
+    const validPaidBy = ["Alan", "Peiya"].includes(paidBy) ? paidBy : "";
+    const isReimbursed = req.body.is_reimbursed === true || req.body.is_reimbursed === "true" || req.body.is_reimbursed === "1" 
+      ? "true" 
+      : "false";
+
     const payload = {
       ...req.body,
       category_id: resolvedCategory.id,
+      paid_by: validPaidBy,
+      is_reimbursed: isReimbursed,
     };
     delete payload.category;
 
@@ -564,11 +614,20 @@ app.put("/api/transactions/:id", requireAuth, async (req, res) => {
         ...DEFAULT_CATEGORY,
       };
 
+    // 處理代墊欄位
+    const paidBy = (req.body.paid_by !== undefined ? req.body.paid_by : found.rowData.paid_by || "").trim();
+    const validPaidBy = ["Alan", "Peiya"].includes(paidBy) ? paidBy : "";
+    const isReimbursed = req.body.is_reimbursed !== undefined
+      ? (req.body.is_reimbursed === true || req.body.is_reimbursed === "true" || req.body.is_reimbursed === "1" ? "true" : "false")
+      : (found.rowData.is_reimbursed === "true" || found.rowData.is_reimbursed === true || found.rowData.is_reimbursed === "1" ? "true" : "false");
+
     const payload = {
       ...found.rowData,
       ...req.body,
       id, // 確保 id 不被覆蓋
       category_id: resolvedCategory.id,
+      paid_by: validPaidBy,
+      is_reimbursed: isReimbursed,
     };
     delete payload.category;
 
@@ -609,6 +668,59 @@ app.delete("/api/transactions/:id", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Failed to delete transaction:", error);
     res.status(500).json({ message: "無法刪除記帳資料", error: error.message });
+  }
+});
+
+// PATCH /api/transactions/:id/reimburse - 標記補款狀態
+app.patch("/api/transactions/:id/reimburse", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_reimbursed } = req.body;
+
+    const found = await findRowById(TRANSACTION_SHEET_RANGE, "id", id);
+    if (!found) {
+      return res.status(404).json({ message: "找不到該筆記帳資料" });
+    }
+
+    const newReimbursedStatus = is_reimbursed === true || is_reimbursed === "true" || is_reimbursed === "1" 
+      ? "true" 
+      : "false";
+
+    // 只更新 is_reimbursed 欄位，保留所有其他欄位（包括 category_id）
+    const payload = {
+      ...found.rowData,
+      is_reimbursed: newReimbursedStatus,
+    };
+    
+    // 確保 category_id 不會被改變
+    if (!payload.category_id || payload.category_id === "") {
+      // 如果原本沒有 category_id，使用預設類別
+      payload.category_id = DEFAULT_CATEGORY.id;
+    }
+
+    await updateRow(
+      "transactions",
+      found.rowIndex,
+      TRANSACTION_COLUMNS,
+      payload
+    );
+
+    const categories = await getCategoryRows();
+    // 使用原本的 category_id，如果找不到則使用預設類別
+    const categoryId = normalizeCategoryId(payload.category_id) || normalizeCategoryId(found.rowData.category_id) || DEFAULT_CATEGORY.id;
+    const category = findCategoryById(categories, categoryId) || DEFAULT_CATEGORY;
+
+    res.json({
+      message: "補款狀態更新成功",
+      data: {
+        ...payload,
+        category_name: category.name,
+        category_color_hex: category.color_hex,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to update reimburse status:", error);
+    res.status(500).json({ message: "無法更新補款狀態", error: error.message });
   }
 });
 
